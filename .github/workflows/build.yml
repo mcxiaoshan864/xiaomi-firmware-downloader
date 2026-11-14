@@ -5,16 +5,33 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: dtolnay/rust-toolchain@stable
+
       - name: Build
         run: cargo build --release
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: mifw-winui
           path: target/release/mifw_winui.exe
+
+      - name: Prepare release binary
+        if: startsWith(github.ref, 'refs/tags/')
+        run: copy target\release\mifw_winui.exe MiFirmware-Downloader.exe
+
+      - name: Attach binary to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: MiFirmware-Downloader.exe
+          tag_name: ${{ github.ref_name }}
