@@ -3,6 +3,7 @@
 mod catalog;
 mod config;
 mod download;
+mod logger;
 mod net;
 
 use std::collections::HashMap;
@@ -18,6 +19,7 @@ use windows_reactor::*;
 
 const CARD: Color = Color::argb(26, 255, 255, 255);
 const SHADE: Color = Color::argb(140, 0, 0, 0);
+const MUTED: Color = Color::argb(170, 255, 255, 255);
 
 struct TaskItem {
     id: u64,
@@ -95,6 +97,7 @@ enum Msg {
     SetDir(String),
     SetConns(Option<f64>),
     SetMaxTasks(Option<f64>),
+    SetProxy(bool),
     CloseChangelog,
 }
 
@@ -401,6 +404,12 @@ impl Component for AppState {
             std::thread::sleep(Duration::from_millis(500));
             Msg::Tick
         });
+        let settings = config::load();
+        net::configure(if settings.use_system_proxy {
+            net::system_proxy()
+        } else {
+            None
+        });
         Self {
             devices: Vec::new(),
             cached: HashMap::new(),
@@ -420,7 +429,7 @@ impl Component for AppState {
             branch_options: Vec::new(),
             tasks: Vec::new(),
             next_id: 1,
-            settings: config::load(),
+            settings,
             show_settings: false,
             changelog: None,
             status: "正在获取固件目录…".into(),
@@ -434,6 +443,12 @@ impl Component for AppState {
         match message {
             Msg::Loaded(Ok(data)) => {
                 self.loading = false;
+                #[cfg(debug_assertions)]
+                if std::env::var("MIFW_SETTINGS").is_ok()
+                    || std::env::args().any(|arg| arg == "--settings")
+                {
+                    self.show_settings = true;
+                }
                 self.devices = data.devices;
                 self.cached = data.roms;
                 let counts = category_counts(&self.devices);
@@ -639,6 +654,7 @@ impl Component for AppState {
                     task.finished = Some(result);
                 }
                 if let Some(text) = status {
+                    logln!("{text}");
                     self.status = text;
                 }
                 self.start_pending(context);
@@ -699,7 +715,7 @@ impl Component for AppState {
             Msg::CloseSettings(saved) => {
                 if saved {
                     config::save(&self.settings);
-                    self.status = "设置已保存".into();
+                    self.apply_proxy();
                     self.start_pending(context);
                 }
                 self.show_settings = false;
@@ -715,6 +731,7 @@ impl Component for AppState {
                     self.settings.max_tasks = value as usize;
                 }
             }
+            Msg::SetProxy(enabled) => self.settings.use_system_proxy = enabled,
             Msg::CloseChangelog => self.changelog = None,
         }
     }
@@ -1013,6 +1030,24 @@ impl Component for AppState {
 }
 
 impl AppState {
+    fn apply_proxy(&mut self) {
+        if self.settings.use_system_proxy {
+            match net::system_proxy() {
+                Some(url) => {
+                    net::configure(Some(url.clone()));
+                    self.status = format!("设置已保存 · 代理 {url}");
+                }
+                None => {
+                    net::configure(None);
+                    self.status = "设置已保存 · 未检测到系统代理，已改回直连".into();
+                }
+            }
+        } else {
+            net::configure(None);
+            self.status = "设置已保存".into();
+        }
+    }
+
     fn settings_overlay(&self, context: &mut ViewContext<Self>) -> View {
         let content = StackPanel::new().spacing(10.0).children((
             TextBlock::new()
@@ -1035,6 +1070,14 @@ impl AppState {
                 .minimum(1.0)
                 .maximum(5.0)
                 .on_value_changed(context.callback(Msg::SetMaxTasks)),
+            CheckBox::new()
+                .is_checked(self.settings.use_system_proxy)
+                .on_is_checked_changed(context.callback(Msg::SetProxy))
+                .content("使用 Windows 系统代理（Clash / v2ray 等）"),
+            TextBlock::new()
+                .text("小米 CDN 直连通常更快；只有在直连很慢时才建议打开")
+                .font_size(11.0)
+                .foreground(Brush::Solid(MUTED)),
             StackPanel::new()
                 .orientation(Orientation::Horizontal)
                 .spacing(8.0)
@@ -1155,6 +1198,8 @@ mod winicon {
 }
 
 fn main() {
+    logger::init();
+    logln!("exe: {:?}", std::env::current_exe());
     std::thread::spawn(winicon::apply);
     windows_reactor::App::run_component::<AppState>(()).unwrap();
 }

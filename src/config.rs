@@ -9,14 +9,18 @@ pub struct Settings {
     pub download_dir: String,
     pub connections: usize,
     pub max_tasks: usize,
+    /// 走 Windows 系统代理（Clash / v2ray 等），默认关闭
+    #[serde(default)]
+    pub use_system_proxy: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
             download_dir: default_download_dir(),
-            connections: 16,
+            connections: 32,
             max_tasks: 2,
+            use_system_proxy: false,
         }
     }
 }

@@ -1,6 +1,6 @@
-//! 多线路测速 + 多线程分段下载（断点续传 / 暂停 / MD5 校验）。
+//! 多线路测速 + 多线程分段下载（断点续传 / 暂停 / MD5 / 线路健康度）。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::Read;
 use std::os::windows::fs::FileExt;
@@ -12,11 +12,13 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use crate::logger;
 use crate::net;
 
-const SAMPLE: u64 = 512 * 1024;
+const SAMPLE: u64 = 256 * 1024;
 const MIN_BLOCK: u64 = 1 << 20;
-const MAX_BLOCK: u64 = 32 << 20;
+const MAX_BLOCK: u64 = 8 << 20;
+const BLOCKS_PER_CONN: u64 = 40;
 
 #[derive(Serialize, Deserialize)]
 struct Meta {
@@ -74,9 +76,18 @@ fn part_path(dest: &Path) -> PathBuf {
     PathBuf::from(format!("{}.part", dest.display()))
 }
 
+/// 原子写：先写 .tmp 再 rename，断电不会留下半个 JSON
+fn save_meta(path: &Path, meta: &Meta) {
+    let Ok(text) = serde_json::to_string(meta) else { return };
+    let tmp = path.with_extension("meta.tmp");
+    if std::fs::write(&tmp, text).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    }
+}
+
 fn probe(url: &str) -> Option<(f64, String, u64)> {
     let started = Instant::now();
-    let mut resp = net::client()
+    let mut resp = net::probe_client()
         .get(url)
         .header("Referer", net::REFERER)
         .header("Range", format!("bytes=0-{}", SAMPLE - 1))
@@ -108,82 +119,173 @@ fn probe(url: &str) -> Option<(f64, String, u64)> {
     Some((got as f64 / secs, url.to_string(), size?))
 }
 
-fn pick_top(candidates: &[String], keep: usize) -> Vec<(String, u64)> {
-    let results = Arc::new(Mutex::new(Vec::<(f64, String, u64)>::new()));
-    let mut handles = Vec::new();
-    for url in candidates.iter().take(4) {
+/// 测速并返回最快的几条线路（按速度降序）
+///
+/// 最多等 4 秒：某些线路 DNS/连接很慢时，不能让整个下载卡在测速上。
+fn pick_sources(candidates: &[String], keep: usize) -> Vec<(String, u64)> {
+    use std::sync::mpsc;
+
+    let (sender, receiver) = mpsc::channel::<(f64, String, u64)>();
+    for url in candidates.iter().take(8) {
         let url = url.clone();
-        let results = Arc::clone(&results);
-        handles.push(thread::spawn(move || {
+        let sender = sender.clone();
+        thread::spawn(move || {
             if let Some(info) = probe(&url) {
-                results.lock().unwrap().push(info);
+                let _ = sender.send(info);
             }
-        }));
+        });
     }
-    for handle in handles {
-        let _ = handle.join();
+    drop(sender);
+
+    let deadline = Instant::now() + Duration::from_millis(4000);
+    let mut results: Vec<(f64, String, u64)> = Vec::new();
+    while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+        match receiver.recv_timeout(remaining) {
+            Ok(info) => results.push(info),
+            Err(_) => break,
+        }
     }
-    let mut guard = results.lock().unwrap().clone();
-    guard.retain(|(_, _, size)| *size > 0);
-    guard.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-    guard.into_iter().take(keep).map(|(_, url, size)| (url, size)).collect()
+
+    results.retain(|(_, _, size)| *size > 0);
+    results.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    for (speed, url, _) in &results {
+        logger::log(&format!("probe {:.0} KB/s  {url}", speed / 1024.0));
+    }
+    results
+        .into_iter()
+        .take(keep)
+        .map(|(_, url, size)| (url, size))
+        .collect()
+}
+
+/// 测速没结果时的兜底：按优先级逐个探测，拿到文件大小就返回
+fn fallback_source(pool: &[String]) -> Option<(String, u64)> {
+    let mut ordered: Vec<&String> = pool.iter().collect();
+    ordered.sort_by_key(|url| {
+        if url.contains("cdnorg") {
+            0
+        } else if url.contains("bn.d.miui") {
+            1
+        } else if url.contains("bksgp") || url.contains("aliyuncs") {
+            2
+        } else if url.contains("bigota") {
+            3
+        } else {
+            4
+        }
+    });
+    for url in ordered {
+        if let Some((_, found, size)) = probe(url) {
+            return Some((found, size));
+        }
+    }
+    None
 }
 
 fn fetch_block(
     sources: &[String],
+    health: &Mutex<HashMap<String, u32>>,
     file: &std::fs::File,
     start: u64,
     end: u64,
     progress: &Progress,
+    start_source: usize,
 ) -> Result<(), String> {
     let mut last = String::from("下载失败");
-    for attempt in 0..6 {
-        let url = &sources[attempt % sources.len().max(1)];
+    let mut attempt = 0usize;
+    while attempt < 8 {
         if progress.cancel.load(Ordering::Relaxed) || progress.paused.load(Ordering::Relaxed) {
             return Ok(());
         }
-        let mut resp = net::client()
+        let url = {
+            let guard = health.lock().unwrap();
+            // 优先用没怎么失败过的线路
+            let mut ordered: Vec<&String> = sources.iter().collect();
+            ordered.sort_by_key(|u| guard.get(*u).copied().unwrap_or(0));
+            ordered[(start_source + attempt) % ordered.len()].clone()
+        };
+        match net::client()
             .get(url.as_str())
             .header("Referer", net::REFERER)
             .header("Range", format!("bytes={start}-{end}"))
             .send()
-            .map_err(|e| e.to_string())?;
-        if !resp.status().is_success() {
-            last = format!("HTTP {}", resp.status());
-            thread::sleep(Duration::from_millis(500 * (attempt as u64 + 1)));
-            continue;
-        }
-        let mut offset = start;
-        let mut buf = vec![0u8; 256 * 1024];
-        loop {
-            if progress.cancel.load(Ordering::Relaxed) || progress.paused.load(Ordering::Relaxed) {
-                return Ok(());
-            }
-            match resp.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    file.seek_write(&buf[..n], offset).map_err(|e| e.to_string())?;
-                    offset += n as u64;
-                    progress.done.fetch_add(n as u64, Ordering::Relaxed);
+        {
+            Ok(mut resp) if resp.status().is_success() => {
+                let mut offset = start;
+                let mut buf = vec![0u8; 256 * 1024];
+                let mut failed = false;
+                loop {
+                    if progress.cancel.load(Ordering::Relaxed) || progress.paused.load(Ordering::Relaxed) {
+                        return Ok(());
+                    }
+                    match resp.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            file.seek_write(&buf[..n], offset).map_err(|e| e.to_string())?;
+                            offset += n as u64;
+                            progress.done.fetch_add(n as u64, Ordering::Relaxed);
+                        }
+                        Err(err) => {
+                            last = err.to_string();
+                            failed = true;
+                            break;
+                        }
+                    }
                 }
-                Err(err) => {
-                    last = err.to_string();
-                    break;
+                if !failed && offset == end + 1 {
+                    health.lock().unwrap().remove(&url);
+                    return Ok(());
                 }
+                if !failed {
+                    last = "连接中断".into();
+                }
+                health.lock().unwrap().entry(url.clone()).or_insert(0);
+                *health.lock().unwrap().get_mut(&url).unwrap() += 1;
+            }
+            Ok(resp) => {
+                last = format!("HTTP {}", resp.status());
+                *health.lock().unwrap().entry(url.clone()).or_insert(0) += 1;
+            }
+            Err(err) => {
+                last = err.to_string();
+                *health.lock().unwrap().entry(url.clone()).or_insert(0) += 1;
             }
         }
-        if offset == end + 1 {
-            return Ok(());
-        }
-        last = "连接中断".into();
+        attempt += 1;
+        let backoff = (300u64 * (1 << attempt.min(3))).min(2000);
+        logger::log(&format!(
+            "block retry {}/{} after {} ms: {}",
+            attempt, 8, backoff, last
+        ));
+        thread::sleep(Duration::from_millis(backoff));
     }
     Err(last)
 }
 
-fn save_meta(path: &Path, meta: &Meta) {
-    if let Ok(text) = serde_json::to_string(meta) {
-        let _ = std::fs::write(path, text);
+/// 剩余空间检查（字节）
+fn free_space(folder: &Path) -> Option<u64> {
+    #[repr(C)]
+    struct U64Parts {
+        low: u32,
+        high: u32,
     }
+    unsafe extern "system" {
+        fn GetDiskFreeSpaceExW(
+            dir: *const u16,
+            free: *mut u64,
+            total: *mut u64,
+            total_free: *mut u64,
+        ) -> i32;
+    }
+    let mut wide: Vec<u16> = folder.to_string_lossy().encode_utf16().collect();
+    wide.push(0);
+    let mut free = 0u64;
+    let mut total = 0u64;
+    let mut total_free = 0u64;
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(wide.as_ptr(), &mut free, &mut total, &mut total_free)
+    };
+    if ok != 0 { Some(free) } else { None }
 }
 
 fn verify_md5(path: &Path, expected: &str) -> Result<bool, String> {
@@ -210,8 +312,9 @@ pub fn run(
     if dest.exists() {
         if let Some(expected) = &expected_md5 {
             if verify_md5(&dest, expected)? {
-                progress.total.store(dest.metadata().map(|m| m.len()).unwrap_or(0), Ordering::Relaxed);
-                progress.done.store(progress.total.load(Ordering::Relaxed), Ordering::Relaxed);
+                let size = dest.metadata().map(|m| m.len()).unwrap_or(0);
+                progress.total.store(size, Ordering::Relaxed);
+                progress.done.store(size, Ordering::Relaxed);
                 progress.set_phase("已完成");
                 return Ok(Outcome::Done);
             }
@@ -224,12 +327,30 @@ pub fn run(
     } else {
         net::mirror_candidates(candidates.first().map(String::as_str).unwrap_or(""))
     };
-    let top = pick_top(&pool, 2);
+    let mut top = pick_sources(&pool, 4);
+    if top.is_empty() {
+        logger::log("probe timeout, fallback to sequential check");
+        if let Some(found) = fallback_source(&pool) {
+            top.push(found);
+        }
+    }
     let Some((best_url, total)) = top.first().cloned() else {
         return Err("所有下载线路都连接失败".into());
     };
-    let sources: Vec<String> = top.iter().map(|(url, _)| url.clone()).collect();
-    let meta_url = best_url.clone();
+    let mut sources: Vec<String> = top.iter().map(|(url, _)| url.clone()).collect();
+    for url in &pool {
+        if sources.len() >= 4 {
+            break;
+        }
+        if !sources.contains(url) {
+            sources.push(url.clone());
+        }
+    }
+    logger::log(&format!(
+        "download start: {best_url} size={total} sources={}",
+        sources.len()
+    ));
+
     progress.total.store(total, Ordering::Relaxed);
     *progress.host.lock().unwrap() = best_url
         .trim_start_matches("https://")
@@ -240,21 +361,38 @@ pub fn run(
 
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        let part = part_path(&dest);
+        let need = if part.exists() {
+            total.saturating_sub(part.metadata().map(|m| m.len()).unwrap_or(0))
+        } else {
+            total
+        };
+        if let Some(free) = free_space(parent) {
+            if free < need + 64 * 1024 * 1024 {
+                return Err(format!(
+                    "磁盘空间不足：还需要 {:.1} GB，剩余 {:.1} GB",
+                    need as f64 / 1073741824.0,
+                    free as f64 / 1073741824.0
+                ));
+            }
+        }
     }
 
-    let target = (conns as u64 * 10).clamp(1, 400);
+    // 块更小 → 慢连接只占小块，天然更均衡
+    let target = (conns as u64 * BLOCKS_PER_CONN).clamp(1, 4000);
     let block = (total / target).clamp(MIN_BLOCK, MAX_BLOCK);
     let blocks = total.div_ceil(block);
+    logger::log(&format!("block={} bytes, blocks={}", block, blocks));
 
     let part = part_path(&dest);
     let meta_file = meta_path(&dest);
 
-    // 读取断点信息
     let mut done_set: HashSet<u64> = HashSet::new();
     if let Ok(text) = std::fs::read_to_string(&meta_file) {
         if let Ok(meta) = serde_json::from_str::<Meta>(&text) {
             if meta.size == total && meta.block == block && part.exists() {
                 done_set = meta.done.into_iter().filter(|i| *i < blocks).collect();
+                logger::log(&format!("resume: {}/{} blocks done", done_set.len(), blocks));
             }
         }
     }
@@ -265,14 +403,12 @@ pub fn run(
         .read(true)
         .open(&part)
         .map_err(|e| e.to_string())?;
-    if file.metadata().map(|m| m.len()).unwrap_or(0) != total {
+    let existing = file.metadata().map(|m| m.len()).unwrap_or(0);
+    if existing != total {
         file.set_len(total).map_err(|e| e.to_string())?;
         done_set.clear();
     }
 
-    let baseline: u64 = done_set.iter().map(|i| (*i * block).min(total) - i * block).sum::<u64>()
-        + done_set.iter().map(|i| (i * block + block).min(total) - i * block).sum::<u64>();
-    let _ = baseline;
     progress.done.store(
         done_set
             .iter()
@@ -285,19 +421,22 @@ pub fn run(
     let cursor = Arc::new(AtomicUsize::new(0));
     let file = Arc::new(file);
     let saver = Arc::new(Mutex::new(Instant::now()));
+    let health = Arc::new(Mutex::new(HashMap::<String, u32>::new()));
 
     progress.set_phase("下载中");
+    let workers = conns.max(1);
     let mut handles = Vec::new();
-    for _ in 0..conns {
-        let worker_meta = meta_url.clone();
+    for _ in 0..workers {
         let cursor = Arc::clone(&cursor);
         let file = Arc::clone(&file);
         let done = Arc::clone(&done);
         let progress = Arc::clone(&progress);
         let saver = Arc::clone(&saver);
+        let health = Arc::clone(&health);
+        let sources = sources.clone();
         let part = part.clone();
         let meta_file = meta_file.clone();
-        let block_sources = sources.clone();
+        let meta_url = best_url.clone();
         handles.push(thread::spawn(move || -> Result<(), String> {
             loop {
                 if progress.cancel.load(Ordering::Relaxed) || progress.paused.load(Ordering::Relaxed) {
@@ -312,7 +451,7 @@ pub fn run(
                 }
                 let start = index * block;
                 let end = (start + block - 1).min(total - 1);
-                fetch_block(&block_sources, &file, start, end, &progress)?;
+                fetch_block(&sources, &health, &file, start, end, &progress, index as usize)?;
                 if progress.paused.load(Ordering::Relaxed) || progress.cancel.load(Ordering::Relaxed) {
                     return Ok(());
                 }
@@ -320,7 +459,7 @@ pub fn run(
                 let mut last = saver.lock().unwrap();
                 if last.elapsed() > Duration::from_secs(2) {
                     let meta = Meta {
-                        url: worker_meta.clone(),
+                        url: meta_url.clone(),
                         size: total,
                         block,
                         done: done.lock().unwrap().iter().copied().collect(),
@@ -355,6 +494,7 @@ pub fn run(
     if cancelled {
         let _ = std::fs::remove_file(&part);
         let _ = std::fs::remove_file(&meta_file);
+        logger::log("download cancelled");
         return Ok(Outcome::Cancelled);
     }
 
@@ -368,10 +508,15 @@ pub fn run(
         };
         save_meta(&meta_file, &meta);
         progress.set_phase(if paused { "已暂停" } else { "等待继续" });
+        logger::log(&format!(
+            "download paused: {}/{} blocks",
+            finished_blocks, blocks
+        ));
         return Ok(Outcome::Paused);
     }
 
     if let Some(err) = error {
+        logger::log(&format!("download error: {err}"));
         return Err(err);
     }
 
@@ -380,6 +525,7 @@ pub fn run(
         if !verify_md5(&part, expected)? {
             let _ = std::fs::remove_file(&part);
             let _ = std::fs::remove_file(&meta_file);
+            logger::log("md5 mismatch");
             return Err("MD5 校验失败，文件可能损坏".into());
         }
     }
@@ -387,5 +533,6 @@ pub fn run(
     std::fs::rename(&part, &dest).map_err(|e| e.to_string())?;
     let _ = std::fs::remove_file(&meta_file);
     progress.set_phase("已完成");
+    logger::log(&format!("download done: {}", dest.display()));
     Ok(Outcome::Done)
 }

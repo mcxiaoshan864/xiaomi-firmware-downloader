@@ -13,6 +13,7 @@ segmented parallel downloads, resumable transfers, and full ROM history.
 - **双数据源合并**：XiaomiFirmwareUpdater 追踪库（最新版本、MD5、直链）+ xiaomirom.com（每机型全量历史版本，按需解析直链）
 - **机型分类**：小米 / Redmi / POCO / 平板 / 其他，带数量，支持名称、代号实时搜索
 - **版本筛选**：地区 / 卡刷·线刷 / 分支 + 版本号搜索，按日期倒序
+- **线路择优**：小米 CDN 的 80 端口通常比 443 更快，测速会优先挑 HTTP 线路；直连很慢时可在设置里打开「使用 Windows 系统代理」，借用 Clash / v2ray 的出口
 - **下载加速**：5 条官方 CDN（bigota / cdnorg / hugeota / bn.d.miui.com / 阿里云 OSS）并发测速，取最快 2 条并行分段，默认 16 线程（可调 1–64），不限速
 - **断点续传**：暂停、退出、关机后继续；块级进度持久化
 - **MD5 校验**：有 MD5 的来源下载完自动核对
@@ -77,3 +78,15 @@ tools/gen_icon.py  图标生成脚本（Pillow）
 ## License
 
 [MIT](LICENSE)
+
+## 更新日志
+
+### v0.2.0
+
+- 修复慢线路上「下载速度几乎为 0」：原来 30 秒总超时 + 64 MB 大块，慢线路每块必然超时、无限重试；改为 600 秒超时 + 1–8 MB 小块
+- 测速最多等 4 秒，不再卡住启动；失败时按 cdnorg → bn → 阿里云 → bigota 顺序兜底
+- 块级多线路轮询 + 线路健康度降级、指数退避，单条线路抖动不再拖垮整体
+- 实测小米 CDN 的 HTTP(80) 明显快于 HTTPS（cdnorg 4.6 vs 1.9 MB/s），候选线路加入 HTTP 变体由测速自动择优
+- 默认连接数 16 → 32
+- 新增「使用 Windows 系统代理」开关（读系统代理设置，可借用 Clash / v2ray 出口）
+- `.meta` 改为原子写，断电不再写坏；下载前预检磁盘空间；新增 `logs/app.log` 日志
