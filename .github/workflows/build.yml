@@ -16,8 +16,11 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - name: Test
+        run: cargo test --locked --bin mifw_winui
+
       - name: Build
-        run: cargo build --release
+        run: cargo build --locked --release
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

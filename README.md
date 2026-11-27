@@ -1,45 +1,38 @@
-# 小米固件下载器 · MiFirmware Downloader
+# 小米固件下载器
 
-> 用 Rust + WinUI 3 写的 Windows 小米 / Redmi / POCO 固件下载工具：多线路测速、多线程分段、断点续传、全量历史版本。
+在 Windows 上查找和下载小米、Redmi、POCO 的 MIUI 与 HyperOS 固件。按机型名称或代号搜索，用地区和刷机方式筛选版本。支持官方 CDN 测速、断点续传和 MD5 校验。
 
-A native Windows firmware downloader for Xiaomi / Redmi / POCO devices, built with Rust and WinUI 3
-(via [windows-rs / windows-reactor](https://github.com/microsoft/windows-rs)). Multi-CDN speed testing,
-segmented parallel downloads, resumable transfers, and full ROM history.
+MiFirmware Downloader is a Rust and WinUI 3 app for browsing and downloading Xiaomi, Redmi, and POCO ROMs on Windows. Filter MIUI and HyperOS releases by device, region, or package type.
 
-![界面截图](docs/screenshot.png)
+![小米固件下载器的 Windows 界面，显示机型列表、固件版本和下载任务](docs/screenshot.png)
 
 ## 功能
 
-- **双数据源合并**：XiaomiFirmwareUpdater 追踪库（最新版本、MD5、直链）+ xiaomirom.com（每机型全量历史版本，按需解析直链）
-- **机型分类**：小米 / Redmi / POCO / 平板 / 其他，带数量，支持名称、代号实时搜索
-- **版本筛选**：地区 / 卡刷·线刷 / 分支 + 版本号搜索，按日期倒序
-- **线路择优**：小米 CDN 的 80 端口通常比 443 更快，测速会优先挑 HTTP 线路；直连很慢时可在设置里打开「使用 Windows 系统代理」，借用 Clash / v2ray 的出口
-- **下载加速**：5 条官方 CDN（bigota / cdnorg / hugeota / bn.d.miui.com / 阿里云 OSS）并发测速，取最快 2 条并行分段，默认 16 线程（可调 1–64），不限速
-- **断点续传**：暂停、退出、关机后继续；块级进度持久化
-- **MD5 校验**：有 MD5 的来源下载完自动核对
-- **多任务队列**：默认同时 2 个（可调 1–5）
-- **设置**：下载目录、连接数、并发数，存于 exe 旁 `config.json`
-- **原生体验**：Mica 背景、系统深浅色、标题栏/任务栏图标、单文件 exe（约 6 MB）
+- **机型与版本** · 支持机型分类和代号搜索，按地区、卡刷、线刷或版本号寻找固件。最新版本与历史版本由 XiaomiFirmwareUpdater 和 XiaomiROM 提供。
+- **下载与校验** · 对官方 CDN 测速，并在写盘前核对响应的字节范围。来源提供 MD5 时，校验通过后才生成最终文件。有 MD5 的任务可选用多条合格线路，无 MD5 时使用单一 HTTPS 线路。
+- **暂停与恢复** · 下载器会保存已完成的分块。重新启动应用后，选择同一固件和下载目录即可尝试继续。有 MD5 或线路提供稳定的 ETag 时可恢复分块；缺少标识时从头下载。
+- **多任务下载** · 默认同时下载 2 个任务，每个任务最多使用 32 个连接。可在设置中修改下载目录、连接数、并发数和系统代理。
 
 ## 下载与运行
 
-从 [Releases](../../releases) 下载 `小米固件下载器.exe`（或自行构建），双击运行。
+从 [Releases](../../releases) 下载 `MiFirmware-Downloader.exe`，双击运行。选择机型后核对地区和卡刷或线刷类型，再点「下载所选固件」。
 
 需要系统已安装 **Windows App SDK 运行时**（Windows 11 一般自带；也可装
 `Microsoft.WindowsAppRuntime.1.7` 及以上）。
 
-默认下载目录为 `D:\XiaomiFirmware`（可在设置中修改）。
+默认优先保存到 `D:\XiaomiFirmware`。没有 D 盘时，保存到用户的「下载」文件夹下的 `XiaomiFirmware`。
 
 ## 构建
 
 需要 Rust 1.95+ 与 MSVC 工具链（`rustc`/`cargo` + Windows SDK 的 `rc.exe`）。
 
 ```bash
-cargo build --release
+cargo test --locked --bin mifw_winui
+cargo build --locked --release
 # 产物：target/release/mifw_winui.exe
 ```
 
-CI：GitHub Actions 会在 Windows runner 上自动构建并上传 artifact（见 `.github/workflows/build.yml`）。
+GitHub Actions 会在 Windows 上运行回归测试、构建并上传可执行文件。
 
 ## 项目结构
 
@@ -56,8 +49,8 @@ tools/gen_icon.py  图标生成脚本（Pillow）
 ## 实现要点
 
 - 小米 CDN 对无 `Referer` 的请求返回 403，所有请求都带 `Referer: https://www.mi.com/`
-- 下载前对候选线路各拉 512 KB 样本测速，选最快两条，块级轮换使用
-- xiaomirom 历史版本按 `机型 → 地区页 → 版本行` 解析；下载时才解析该版本的官方直链，避免预抓
+- 下载前在候选线路上请求 256 KiB 样本。有 MD5 时，最多并行使用四条支持分段的同大小线路。
+- XiaomiROM 历史直链按需解析，必须与所选版本及刷机类型匹配。
 - WinUI 3 使用 [windows-reactor](https://crates.io/crates/windows-reactor) 声明式 API，无 XAML 文件
 
 ## 数据来源与免责声明
@@ -73,13 +66,19 @@ tools/gen_icon.py  图标生成脚本（Pillow）
 - [ ] 多选批量下载、完成通知、收藏机型
 - [ ] 代理设置、拼音搜索
 - [ ] 安装包（MSIX / Inno Setup）与自动更新
-- [ ] 解析器与续传逻辑的单元测试
 
 ## License
 
 [MIT](LICENSE)
 
 ## 更新日志
+
+### v0.2.1
+
+- 历史版本加载和排序时保留所选固件，历史直链按版本和刷机类型匹配。
+- 校验分段响应和断点身份，显示 MD5 校验状态，并保护已有目标文件。
+- 下载队列按目标去重，等待当前下载线程退出后再恢复任务。失败时显示原因并提供重试。
+- 旧版断点文件缺少固件身份。首次使用新版恢复旧任务时，会重新下载对应固件。
 
 ### v0.2.0
 
