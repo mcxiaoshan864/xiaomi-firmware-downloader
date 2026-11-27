@@ -12,7 +12,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use catalog::{Device, Rom};
+use catalog::{Device, Rom, RomKey};
 use config::Settings;
 use download::{Outcome, Progress};
 use windows_reactor::*;
@@ -24,20 +24,55 @@ const MUTED: Color = Color::argb(170, 255, 255, 255);
 struct TaskItem {
     id: u64,
     title: String,
+    device: String,
+    package: RomKey,
     urls: Vec<String>,
     detail: Option<String>,
-    resolving: bool,
-    method: String,
-    md5: String,
-    dest: PathBuf,
+    md5: Option<String>,
+    folder: PathBuf,
+    dest: Option<PathBuf>,
     progress: Arc<Progress>,
     speed: f64,
     last_done: u64,
     last_seen: Instant,
-    finished: Option<Result<Outcome, String>>,
-    started: bool,
-    queued: bool,
+    state: TaskState,
     handle: Option<ComponentTask>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum TaskState {
+    Resolving,
+    Queued,
+    Running,
+    Pausing,
+    Cancelling,
+    Paused,
+    Cancelled,
+    Done,
+    Failed(String),
+}
+
+impl TaskState {
+    fn active(&self) -> bool {
+        matches!(self, Self::Running | Self::Pausing | Self::Cancelling)
+    }
+
+    fn can_remove(&self) -> bool {
+        matches!(self, Self::Done | Self::Cancelled | Self::Failed(_))
+    }
+
+    fn can_cancel(&self) -> bool {
+        matches!(self, Self::Resolving | Self::Queued | Self::Running | Self::Pausing | Self::Paused)
+    }
+
+    fn toggle_label(&self) -> Option<&'static str> {
+        match self {
+            Self::Running => Some("暂停"),
+            Self::Paused => Some("继续"),
+            Self::Failed(_) => Some("重试"),
+            _ => None,
+        }
+    }
 }
 
 struct AppState {
@@ -45,7 +80,7 @@ struct AppState {
     cached: HashMap<String, Vec<Rom>>,
     roms: Vec<Rom>,
     device_index: Option<usize>,
-    rom_index: Option<usize>,
+    rom_key: Option<RomKey>,
     device_view: Vec<usize>,
     rom_view: Vec<usize>,
 
@@ -74,7 +109,7 @@ enum Msg {
     Loaded(Result<catalog::Catalog, String>),
     SelectDevice(Option<usize>),
     History(usize, Vec<Rom>),
-    SelectRom(Option<usize>),
+    SelectRom(Option<usize>, Option<RomKey>),
     Search(String),
     FilterCategory(Option<usize>),
     FilterRegion(Option<usize>),
@@ -87,7 +122,7 @@ enum Msg {
     RemoveTask(u64),
     OpenTask(u64),
     TaskDone(u64, Result<Outcome, String>),
-    Resolved(u64, Vec<String>),
+    Resolved(u64, Result<Vec<String>, String>),
     Tick,
     CopyLink,
     OpenBrowser,
@@ -128,13 +163,30 @@ fn category_counts(devices: &[Device]) -> [usize; 5] {
     counts
 }
 
-fn filename_from_url(url: &str) -> String {
-    url.rsplit('/').next().unwrap_or("firmware.bin").to_string()
+fn same_target(left: &std::path::Path, right: &std::path::Path) -> bool {
+    left.to_string_lossy().to_lowercase() == right.to_string_lossy().to_lowercase()
 }
 
-impl TaskItem {
-    fn active(&self) -> bool {
-        self.started && self.finished.is_none()
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pausing_and_cancelling_hold_the_slot_until_the_worker_exits() {
+        for state in [TaskState::Pausing, TaskState::Cancelling] {
+            assert!(state.active());
+            assert!(state.toggle_label().is_none());
+            assert!(!state.can_remove());
+        }
+        assert!(!TaskState::Paused.active());
+        assert_eq!(TaskState::Paused.toggle_label(), Some("继续"));
+    }
+
+    #[test]
+    fn duplicate_targets_are_compared_case_insensitively() {
+        use std::path::Path;
+        assert!(same_target(Path::new(r"D:\ROMs\OS.zip"), Path::new(r"d:\roms\os.ZIP")));
+        assert!(!same_target(Path::new(r"D:\ROMs\OS.zip"), Path::new(r"D:\ROMs\OS.tgz")));
     }
 }
 
@@ -162,6 +214,7 @@ impl AppState {
     }
 
     fn rebuild_roms(&mut self) {
+        let query = self.version_query.to_lowercase();
         self.rom_view = self
             .roms
             .iter()
@@ -170,11 +223,15 @@ impl AppState {
                 (self.region.is_empty() || rom.region == self.region)
                     && (self.method.is_empty() || rom.method == self.method)
                     && (self.branch.is_empty() || rom.branch == self.branch)
-                    && (self.version_query.is_empty()
-                        || rom.version.to_lowercase().contains(&self.version_query.to_lowercase()))
+                    && (query.is_empty() || rom.version.to_lowercase().contains(&query))
             })
             .map(|(index, _)| index)
             .collect();
+        if self.rom_key.as_ref().is_some_and(|key| {
+            !self.rom_view.iter().any(|&index| self.roms[index].matches(key))
+        }) {
+            self.rom_key = None;
+        }
     }
 
     fn refresh_options(&mut self) {
@@ -200,44 +257,37 @@ impl AppState {
     }
 
     fn selected_rom(&self) -> Option<Rom> {
-        self.rom_index.and_then(|index| self.roms.get(index)).cloned()
+        let key = self.rom_key.as_ref()?;
+        self.rom_view
+            .iter()
+            .map(|&index| &self.roms[index])
+            .find(|rom| rom.matches(key))
+            .cloned()
     }
 
     fn start_pending(&mut self, context: &ComponentContext<Self>) {
-        let max_tasks = self.settings.max_tasks.max(1);
-        let mut active = self.tasks.iter().filter(|t| t.active()).count();
-        for index in 0..self.tasks.len() {
+        let max_tasks = self.settings.max_tasks.clamp(1, 5);
+        let mut active = self.tasks.iter().filter(|task| task.state.active()).count();
+        for task in &mut self.tasks {
             if active >= max_tasks {
                 break;
             }
-            if self.tasks[index].started || self.tasks[index].finished.is_some() {
+            if task.state != TaskState::Queued {
                 continue;
             }
-            if self.tasks[index].urls.is_empty() {
-                continue;
-            }
-            if self.tasks[index].dest.as_os_str().is_empty() {
-                let name = filename_from_url(&self.tasks[index].urls[0]);
-                self.tasks[index].dest = PathBuf::from(&self.settings.download_dir).join(name);
-            }
-            let id = self.tasks[index].id;
-            let urls = self.tasks[index].urls.clone();
-            let dest = self.tasks[index].dest.clone();
-            let md5 = if self.tasks[index].md5.is_empty() {
-                None
-            } else {
-                Some(self.tasks[index].md5.clone())
-            };
-            let progress = Arc::clone(&self.tasks[index].progress);
-            let conns = self.settings.connections.max(1);
-            let handle = context.spawn_background(move |_token| {
-                Msg::TaskDone(id, download::run(urls, dest, conns, md5, progress))
-            });
-            let task = &mut self.tasks[index];
-            task.started = true;
-            task.queued = false;
+            let Some(dest) = task.dest.clone() else { continue };
+            let (id, urls, md5) = (task.id, task.urls.clone(), task.md5.clone());
             task.progress.paused.store(false, Ordering::Relaxed);
-            task.handle = Some(handle);
+            task.progress.cancel.store(false, Ordering::Relaxed);
+            task.last_done = task.progress.done.load(Ordering::Relaxed);
+            task.last_seen = Instant::now();
+            task.state = TaskState::Running;
+            self.status = format!("正在下载：{}", task.title);
+            let progress = Arc::clone(&task.progress);
+            let conns = self.settings.connections.clamp(1, 64);
+            task.handle = Some(context.spawn_background(move |_token| {
+                Msg::TaskDone(id, download::run(urls, dest, conns, md5, progress))
+            }));
             active += 1;
         }
     }
@@ -257,45 +307,47 @@ impl AppState {
             self.status = "请先在列表中选择一个固件版本".into();
             return;
         };
+        let Some(device) = self.device_index.and_then(|index| self.devices.get(index)) else { return };
+        let package = rom.key();
+        if self.tasks.iter().any(|task| {
+            task.device == device.base && task.package == package && task.state != TaskState::Cancelled
+        }) {
+            self.status = "这个固件已在下载列表中".into();
+            return;
+        }
+        let folder = self.settings.download_dir.trim();
+        if folder.is_empty() {
+            self.status = "请先在设置中指定下载目录".into();
+            return;
+        }
+        let Ok(folder) = std::path::absolute(folder) else {
+            self.status = "下载目录无效，请检查设置".into();
+            return;
+        };
+        let folder = std::fs::canonicalize(&folder).unwrap_or(folder);
         let id = self.next_id;
         self.next_id += 1;
-        let mut urls = Vec::new();
-        if !rom.url.is_empty() {
-            urls.push(rom.url.clone());
-        }
-        let resolving = urls.is_empty() && rom.detail.is_some();
-        let dest = if urls.is_empty() {
-            PathBuf::new()
-        } else {
-            PathBuf::from(&self.settings.download_dir).join(filename_from_url(&urls[0]))
-        };
         self.tasks.push(TaskItem {
             id,
             title: format!("{} · {} · {}", rom.version, rom.region, rom.method),
-            urls,
+            device: device.base.clone(),
+            package,
+            urls: Vec::new(),
             detail: rom.detail.clone(),
-            resolving,
-            method: rom.method.clone(),
-            md5: rom.md5.clone(),
-            dest,
+            md5: download::normalized_md5(&rom.md5),
+            folder,
+            dest: None,
             progress: Progress::new(),
             speed: 0.0,
             last_done: 0,
             last_seen: Instant::now(),
-            finished: None,
-            started: false,
-            queued: true,
+            state: TaskState::Resolving,
             handle: None,
         });
-        if resolving {
-            self.status = format!("正在解析下载地址：{}", rom.version);
-            if let Some(detail) = rom.detail.clone() {
-                self._loads.push(context.spawn_background(move |_token| {
-                    Msg::Resolved(id, catalog::resolve_download(&detail))
-                }));
-            }
+        if rom.url.is_empty() {
+            self.resolve_task(id, context);
         } else {
-            self.status = format!("已加入队列：{}", rom.version);
+            self.assign_urls(id, vec![rom.url]);
         }
         self.start_pending(context);
         if self._tick.is_none() {
@@ -303,6 +355,57 @@ impl AppState {
                 std::thread::sleep(Duration::from_millis(500));
                 Msg::Tick
             }));
+        }
+    }
+
+    fn resolve_task(&mut self, id: u64, context: &ComponentContext<Self>) {
+        let Some(task) = self.tasks.iter_mut().find(|task| task.id == id) else { return };
+        if let Some(detail) = task.detail.clone() {
+            task.state = TaskState::Resolving;
+            let key = task.package.clone();
+            self.status = format!("正在解析下载地址：{}", key.version);
+            task.handle = Some(context.spawn_background(move |_token| {
+                Msg::Resolved(id, catalog::resolve_download(&detail, &key))
+            }));
+        } else {
+            let error = "该版本没有可用的下载地址".to_string();
+            task.state = TaskState::Failed(error.clone());
+            self.status = error;
+        }
+    }
+
+    fn assign_urls(&mut self, id: u64, urls: Vec<String>) {
+        let Some(index) = self.tasks.iter().position(|task| task.id == id) else { return };
+        let task = &self.tasks[index];
+        let urls: Vec<_> = urls
+            .into_iter()
+            .filter(|url| catalog::package_url_matches(url, &task.package))
+            .collect();
+        let target = urls
+            .first()
+            .and_then(|url| net::firmware_filename(url))
+            .map(|name| task.folder.join(name));
+        let duplicate = target.as_ref().is_some_and(|path| {
+            self.tasks.iter().any(|other| {
+                other.id != id && other.state != TaskState::Cancelled
+                    && other.dest.as_ref().is_some_and(|dest| same_target(dest, path))
+            })
+        });
+        let task = &mut self.tasks[index];
+        task.handle = None;
+        task.urls = urls;
+        if duplicate {
+            let error = "另一个任务已使用相同的目标文件".to_string();
+            self.status = error.clone();
+            task.state = TaskState::Failed(error);
+        } else if let Some(target) = target {
+            task.dest = Some(target);
+            task.state = TaskState::Queued;
+            self.status = format!("已加入队列：{}", task.title);
+        } else {
+            let error = "下载地址与所选版本或刷机类型不匹配".to_string();
+            self.status = error.clone();
+            task.state = TaskState::Failed(error);
         }
     }
 
@@ -314,39 +417,35 @@ impl AppState {
         } else {
             0.0
         };
-        let phase = if let Some(result) = &task.finished {
-            match result {
-                Ok(Outcome::Done) => "已完成".to_string(),
-                Ok(Outcome::Cancelled) => "已取消".to_string(),
-                Ok(Outcome::Paused) => "已暂停".to_string(),
-                Err(err) => format!("失败：{err}"),
-            }
-        } else if task.progress.paused.load(Ordering::Relaxed) {
-            "正在暂停…".to_string()
-        } else if task.queued || !task.started {
-            "排队中".to_string()
-        } else {
-            task.progress.phase()
+        let phase = match &task.state {
+            TaskState::Resolving => "正在解析地址…".to_string(),
+            TaskState::Queued => "排队中".to_string(),
+            TaskState::Running => task.progress.phase(),
+            TaskState::Pausing => "正在暂停…".to_string(),
+            TaskState::Cancelling => "正在取消…".to_string(),
+            TaskState::Paused => "已暂停".to_string(),
+            TaskState::Cancelled => "已取消".to_string(),
+            TaskState::Done if task.md5.is_some() => "已完成 · MD5 校验通过".to_string(),
+            TaskState::Done => "已完成 · 来源未提供校验值".to_string(),
+            TaskState::Failed(err) => format!("失败：{err}"),
         };
 
-        let running = task.active() && !task.progress.paused.load(Ordering::Relaxed);
-        let can_resume = matches!(task.finished, Some(Ok(Outcome::Paused)))
-            || task.progress.paused.load(Ordering::Relaxed);
-        let toggle_label = if can_resume { "继续" } else { "暂停" };
+        let toggle_label = task.state.toggle_label();
         let id = task.id;
         let toggle = Button::new()
-            .is_enabled(can_resume || running)
+            .is_enabled(toggle_label.is_some())
             .on_click(context.callback(move |_: ()| Msg::ToggleTask(id)))
-            .content(toggle_label);
+            .content(toggle_label.unwrap_or("暂停"));
         let cancel = Button::new()
-            .is_enabled(task.finished.is_none())
+            .is_enabled(task.state.can_cancel())
             .on_click(context.callback(move |_: ()| Msg::CancelTask(id)))
             .content("取消");
         let open = Button::new()
+            .is_enabled(task.dest.is_some())
             .on_click(context.callback(move |_: ()| Msg::OpenTask(id)))
             .content("打开");
         let remove = Button::new()
-            .is_enabled(task.finished.is_some())
+            .is_enabled(task.state.can_remove())
             .on_click(context.callback(move |_: ()| Msg::RemoveTask(id)))
             .content("移除");
 
@@ -358,7 +457,7 @@ impl AppState {
                     TextBlock::new().text(task.title.clone()).font_weight(FontWeight::BOLD),
                     TextBlock::new().text(phase).font_size(12.0),
                 )),
-            ProgressBar::new().maximum(100.0).value(percent),
+            ProgressBar::new().maximum(100.0).value(percent.min(100.0)),
             StackPanel::new()
                 .orientation(Orientation::Horizontal)
                 .spacing(8.0)
@@ -415,7 +514,7 @@ impl Component for AppState {
             cached: HashMap::new(),
             roms: Vec::new(),
             device_index: None,
-            rom_index: None,
+            rom_key: None,
             device_view: Vec::new(),
             rom_view: Vec::new(),
             search: String::new(),
@@ -475,7 +574,7 @@ impl Component for AppState {
                     #[cfg(debug_assertions)]
                     if std::env::var("MIFW_AUTODL").is_ok() {
                         if let Some(position) = self.rom_view.first().copied() {
-                            self.rom_index = Some(position);
+                            self.rom_key = Some(self.roms[position].key());
                             self.queue_task(context);
                         }
                     }
@@ -491,7 +590,7 @@ impl Component for AppState {
                     return;
                 }
                 self.device_index = target;
-                self.rom_index = None;
+                self.rom_key = None;
                 self.roms.clear();
                 self.rom_view.clear();
                 let Some(index) = self.device_index else { return };
@@ -510,32 +609,17 @@ impl Component for AppState {
                 if self.device_index != Some(index) || extra.is_empty() {
                     return;
                 }
-                let mut known: Vec<String> = self
-                    .roms
-                    .iter()
-                    .filter(|r| !r.version.trim().is_empty())
-                    .map(|r| format!("{}|{}|{}", r.version, r.region, r.method))
-                    .collect();
-                self.roms.retain(|r| !r.version.trim().is_empty());
-                for rom in extra {
-                    if rom.version.trim().is_empty() {
-                        continue;
-                    }
-                    let key = format!("{}|{}|{}", rom.version, rom.region, rom.method);
-                    if !known.contains(&key) {
-                        known.push(key);
-                        self.roms.push(rom);
-                    }
-                }
-                self.roms.sort_by(|a, b| {
-                    b.date.cmp(&a.date).then_with(|| b.version.cmp(&a.version))
-                });
+                catalog::merge_roms(&mut self.roms, extra);
                 self.refresh_options();
                 self.rebuild_roms();
                 self.status = format!("{} 个版本", self.roms.len());
             }
-            Msg::SelectRom(position) => {
-                self.rom_index = position.and_then(|p| self.rom_view.get(p).copied());
+            Msg::SelectRom(device, key) => {
+                if self.device_index == device {
+                    self.rom_key = key.filter(|key| {
+                        self.rom_view.iter().any(|&index| self.roms[index].matches(key))
+                    });
+                }
             }
             Msg::Search(text) => {
                 self.search = text;
@@ -587,12 +671,12 @@ impl Component for AppState {
                         .find(|i| self.roms[**i].url.is_empty() && self.roms[**i].detail.is_some())
                         .copied()
                     {
-                        self.rom_index = Some(position);
+                        self.rom_key = Some(self.roms[position].key());
                         self.queue_task(context);
                     }
                 }
                 for task in self.tasks.iter_mut() {
-                    if task.active() {
+                    if task.state.active() {
                         let done = task.progress.done.load(Ordering::Relaxed);
                         let elapsed = task.last_seen.elapsed().as_secs_f64();
                         if elapsed > 0.2 {
@@ -609,51 +693,74 @@ impl Component for AppState {
                 let Some(task) = self.tasks.iter_mut().find(|t| t.id == id) else {
                     return;
                 };
-                if task.progress.paused.load(Ordering::Relaxed) {
-                    task.progress.paused.store(false, Ordering::Relaxed);
-                    task.finished = None;
-                    task.started = false;
-                    task.queued = true;
-                    task.last_done = task.progress.done.load(Ordering::Relaxed);
-                    task.last_seen = Instant::now();
-                } else if task.finished.is_none() {
-                    task.progress.paused.store(true, Ordering::Relaxed);
+                match task.state {
+                    TaskState::Running => {
+                        task.state = TaskState::Pausing;
+                        task.progress.paused.store(true, Ordering::Relaxed);
+                        self.status = format!("正在暂停：{}", task.title);
+                    }
+                    TaskState::Paused => {
+                        task.state = TaskState::Queued;
+                        self.status = format!("已重新加入队列：{}", task.title);
+                    }
+                    TaskState::Failed(_) if task.urls.is_empty() => self.resolve_task(id, context),
+                    TaskState::Failed(_) => {
+                        let urls = task.urls.clone();
+                        self.assign_urls(id, urls);
+                    }
+                    _ => {}
                 }
                 self.start_pending(context);
             }
             Msg::CancelTask(id) => {
-                if let Some(task) = self.tasks.iter().find(|t| t.id == id) {
-                    task.progress.cancel.store(true, Ordering::Relaxed);
-                    task.progress.paused.store(false, Ordering::Relaxed);
+                if let Some(task) = self.tasks.iter_mut().find(|t| t.id == id) {
+                    let has_partial = task.state == TaskState::Paused
+                        || task.progress.total.load(Ordering::Relaxed) > 0;
+                    match task.state {
+                        TaskState::Paused | TaskState::Queued if has_partial => {
+                            if let Some(dest) = task.dest.clone() {
+                                task.state = TaskState::Cancelling;
+                                self.status = format!("正在取消：{}", task.title);
+                                task.handle = Some(context.spawn_background(move |_token| {
+                                    Msg::TaskDone(id, download::discard_partial(&dest).map(|()| Outcome::Cancelled))
+                                }));
+                            }
+                        }
+                        TaskState::Resolving | TaskState::Queued => {
+                            task.handle = None;
+                            task.state = TaskState::Cancelled;
+                            self.status = format!("已取消：{}", task.title);
+                        }
+                        TaskState::Running | TaskState::Pausing => {
+                            task.state = TaskState::Cancelling;
+                            self.status = format!("正在取消：{}", task.title);
+                            task.progress.cancel.store(true, Ordering::Relaxed);
+                        }
+                        _ => {}
+                    }
                 }
+                self.start_pending(context);
             }
             Msg::RemoveTask(id) => {
-                self.tasks.retain(|t| t.id != id || t.finished.is_none());
+                self.tasks.retain(|t| t.id != id || !t.state.can_remove());
                 self.start_pending(context);
             }
             Msg::OpenTask(id) => {
                 if let Some(task) = self.tasks.iter().find(|t| t.id == id) {
-                    let folder = task
-                        .dest
-                        .parent()
-                        .map(|p| p.to_path_buf())
-                        .unwrap_or_default();
-                    let _ = std::fs::create_dir_all(&folder);
-                    let _ = std::process::Command::new("explorer").arg(folder).spawn();
+                    let _ = std::fs::create_dir_all(&task.folder);
+                    let _ = std::process::Command::new("explorer").arg(&task.folder).spawn();
                 }
             }
             Msg::TaskDone(id, result) => {
-                let mut status = None;
-                if let Some(task) = self.tasks.iter_mut().find(|t| t.id == id) {
-                    status = Some(match &result {
-                        Ok(Outcome::Done) => format!("下载完成：{}", task.title),
-                        Ok(Outcome::Paused) => format!("已暂停：{}", task.title),
-                        Ok(Outcome::Cancelled) => format!("已取消：{}", task.title),
-                        Err(err) => format!("下载失败：{err}"),
-                    });
-                    task.finished = Some(result);
-                }
-                if let Some(text) = status {
+                if let Some(task) = self.tasks.iter_mut().find(|t| t.id == id && t.state.active()) {
+                    let (state, text) = match result {
+                        Ok(Outcome::Done) => (TaskState::Done, format!("下载完成：{}", task.title)),
+                        Ok(Outcome::Paused) => (TaskState::Paused, format!("已暂停：{}", task.title)),
+                        Ok(Outcome::Cancelled) => (TaskState::Cancelled, format!("已取消：{}", task.title)),
+                        Err(err) => (TaskState::Failed(err.clone()), format!("下载失败：{err}")),
+                    };
+                    task.state = state;
+                    task.handle = None;
                     logln!("{text}");
                     self.status = text;
                 }
@@ -692,21 +799,15 @@ impl Component for AppState {
                     self.changelog = Some((rom.version.clone(), text));
                 }
             }
-            Msg::Resolved(id, urls) => {
-                if let Some(task) = self.tasks.iter_mut().find(|t| t.id == id) {
-                    task.resolving = false;
-                    let suffix = if task.method == "线刷" { ".tgz" } else { ".zip" };
-                    let mut matched: Vec<String> =
-                        urls.iter().filter(|u| u.contains(suffix)).cloned().collect();
-                    if matched.is_empty() {
-                        matched = urls;
-                    }
-                    let urls = matched;
-                    if urls.is_empty() {
-                        task.finished = Some(Err("无法解析下载地址".into()));
-                        self.status = "解析下载地址失败，请换一个版本".into();
-                    } else {
-                        task.urls = urls;
+            Msg::Resolved(id, result) => {
+                if let Some(task) = self.tasks.iter_mut().find(|t| t.id == id && t.state == TaskState::Resolving) {
+                    match result {
+                        Ok(urls) => self.assign_urls(id, urls),
+                        Err(err) => {
+                            task.handle = None;
+                            task.state = TaskState::Failed(err.clone());
+                            self.status = err;
+                        }
                     }
                 }
                 self.start_pending(context);
@@ -737,7 +838,7 @@ impl Component for AppState {
     }
 
     fn view(&self, _input: &(), context: &mut ViewContext<Self>) -> View {
-        context.window_title("小米固件下载器");
+        context.window_title(concat!("小米固件下载器 v", env!("CARGO_PKG_VERSION")));
         context.window_visuals(
             WindowVisuals::new()
                 .backdrop(WindowBackdrop::Mica)
@@ -747,8 +848,7 @@ impl Component for AppState {
         let device_items: Vec<KeyedView> = self
             .device_view
             .iter()
-            .enumerate()
-            .map(|(position, index)| {
+            .map(|index| {
                 let device = &self.devices[*index];
                 KeyedView::new(
                     format!("d{index}"),
@@ -858,11 +958,10 @@ impl Component for AppState {
         let rom_items: Vec<KeyedView> = self
             .rom_view
             .iter()
-            .enumerate()
-            .map(|(position, index)| {
+            .map(|index| {
                 let rom = &self.roms[*index];
                 KeyedView::new(
-                    format!("r{index}"),
+                    format!("r:{}:{}:{}", rom.version, rom.region, rom.method),
                     TextBlock::new().text(format!(
                         "{}   ·   {}   ·   {}   ·   {}   ·   {}   ·   {}",
                         rom.version, rom.region, rom.method, rom.branch, rom.size_text, rom.date
@@ -872,13 +971,15 @@ impl Component for AppState {
             })
             .collect();
 
-        let rom_selected = self
-            .rom_index
-            .and_then(|index| self.rom_view.iter().position(|i| *i == index));
+        let keys: Vec<_> = self.rom_view.iter().map(|&index| self.roms[index].key()).collect();
+        let rom_selected = self.rom_key.as_ref().and_then(|key| keys.iter().position(|item| item == key));
+        let device = self.device_index;
 
         let rom_list = ListView::new()
             .selected_index(rom_selected)
-            .on_selection_changed(context.callback(Msg::SelectRom))
+            .on_selection_changed(context.callback(move |position: Option<usize>| {
+                Msg::SelectRom(device, position.and_then(|index| keys.get(index).cloned()))
+            }))
             .collection_slot(ListViewSlot::Items, rom_items);
 
         let selected_text = self
@@ -900,6 +1001,7 @@ impl Component for AppState {
                     .font_weight(FontWeight::MEDIUM),
                 Button::new()
                     .style(ButtonStyle::Accent)
+                    .is_enabled(self.rom_key.is_some())
                     .on_click(context.callback(|_: ()| Msg::Download))
                     .content("下载所选固件"),
                 Button::new()

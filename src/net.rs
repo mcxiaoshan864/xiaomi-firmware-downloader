@@ -27,11 +27,12 @@ const TRACKER_MIRRORS: &[&str] = &[
 type HttpClient = reqwest::blocking::Client;
 
 fn build_client(proxy: Option<&str>) -> HttpClient {
-    // 整体超时给足 10 分钟：8MB 的块在 30KB/s 的线路上也不会被误杀。
-    // 之前 30 秒总超时会导致慢线路每块都失败、一直重试，速度接近 0。
+    // With reqwest's blocking client this timeout applies to each streaming read.
+    // A slow transfer can keep making progress, but a stalled read cannot delay a pause indefinitely.
     let mut builder = reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(600))
+        .timeout(Duration::from_secs(15))
+        .redirect(redirect_policy())
         .user_agent(UA);
     if let Some(url) = proxy {
         if let Ok(proxy) = reqwest::Proxy::all(url) {
@@ -39,6 +40,60 @@ fn build_client(proxy: Option<&str>) -> HttpClient {
         }
     }
     builder.build().expect("http client")
+}
+
+/// Parse a firmware URL before letting it determine the file name or the download host.
+pub fn firmware_url(raw: &str) -> Option<reqwest::Url> {
+    let url = reqwest::Url::parse(raw).ok()?;
+    if !matches!(url.scheme(), "https" | "http")
+        || !CDN_HOSTS.contains(&url.host_str()?)
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port().is_some()
+    {
+        return None;
+    }
+    let name = url.path_segments()?.next_back()?;
+    if !(name.ends_with(".zip") || name.ends_with(".tgz"))
+        || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.+".contains(&b))
+    {
+        return None;
+    }
+    let stem = name.split('.').next()?;
+    let reserved = ["CON", "PRN", "AUX", "NUL"];
+    if stem.is_empty()
+        || reserved.iter().any(|word| stem.eq_ignore_ascii_case(word))
+        || (stem.len() == 4
+            && (stem[..3].eq_ignore_ascii_case("COM") || stem[..3].eq_ignore_ascii_case("LPT"))
+            && stem.as_bytes()[3].is_ascii_digit())
+    {
+        return None;
+    }
+    Some(url)
+}
+
+pub fn firmware_filename(raw: &str) -> Option<String> {
+    Some(firmware_url(raw)?.path_segments()?.next_back()?.to_string())
+}
+
+fn redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        let previous = attempt.previous();
+        if previous.len() >= 10 {
+            return attempt.error("too many redirects");
+        }
+        if previous.first().is_some_and(|url| firmware_url(url.as_str()).is_some()) {
+            let next = attempt.url();
+            let last = &previous[previous.len() - 1];
+            if firmware_url(next.as_str()).is_none()
+                || next.path() != last.path()
+                || (last.scheme() == "https" && next.scheme() != "https")
+            {
+                return attempt.error("固件链接重定向到了不同的地址");
+            }
+        }
+        attempt.follow()
+    })
 }
 
 static CLIENT: OnceLock<RwLock<Option<Arc<HttpClient>>>> = OnceLock::new();
@@ -60,6 +115,7 @@ pub fn configure(proxy: Option<String>) {
     let mut probe = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(6))
         .connect_timeout(Duration::from_secs(4))
+        .redirect(redirect_policy())
         .user_agent(UA);
     if let Some(url) = proxy {
         if let Ok(p) = reqwest::Proxy::all(url) {

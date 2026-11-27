@@ -25,6 +25,55 @@ pub struct Rom {
     pub detail: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct RomKey {
+    pub version: String,
+    pub region: String,
+    pub method: String,
+}
+
+impl Rom {
+    pub fn key(&self) -> RomKey {
+        RomKey {
+            version: self.version.clone(),
+            region: self.region.clone(),
+            method: self.method.clone(),
+        }
+    }
+
+    pub fn matches(&self, key: &RomKey) -> bool {
+        self.version == key.version && self.region == key.region && self.method == key.method
+    }
+}
+
+pub fn merge_roms(roms: &mut Vec<Rom>, extra: Vec<Rom>) {
+    let mut entries: HashMap<RomKey, Rom> = HashMap::new();
+    for rom in std::mem::take(roms).into_iter().chain(extra) {
+        if rom.version.trim().is_empty() {
+            continue;
+        }
+        let strength = |r: &Rom| (!r.url.is_empty(), !r.md5.is_empty());
+        match entries.entry(rom.key()) {
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(rom);
+            }
+            std::collections::hash_map::Entry::Occupied(mut slot) => {
+                if strength(&rom) > strength(slot.get()) {
+                    slot.insert(rom);
+                }
+            }
+        }
+    }
+    roms.extend(entries.into_values());
+    roms.sort_by(|a, b| {
+        b.date
+            .cmp(&a.date)
+            .then_with(|| b.version.cmp(&a.version))
+            .then_with(|| a.region.cmp(&b.region))
+            .then_with(|| a.method.cmp(&b.method))
+    });
+}
+
 pub struct Catalog {
     pub devices: Vec<Device>,
     pub roms: HashMap<String, Vec<Rom>>,
@@ -375,7 +424,7 @@ pub fn load() -> Result<Catalog, String> {
     devices.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
 
     for roms in by_base.values_mut() {
-        roms.sort_by(|a, b| b.version.cmp(&a.version));
+        merge_roms(roms, Vec::new());
     }
 
     Ok(Catalog { devices, roms: by_base })
@@ -447,8 +496,7 @@ fn region_from_url(url: &str) -> String {
 
 fn normalize_date(value: &str) -> String {
     let value = value.trim();
-    if value.len() >= 10 {
-        let head = &value[..10];
+    if let Some(head) = value.get(..10) {
         let bytes = head.as_bytes();
         if bytes[4] == b'-' && bytes[7] == b'-' {
             return head.to_string();
@@ -529,9 +577,14 @@ pub fn xiaomirom_history(base: &str) -> Vec<Rom> {
         return Vec::new();
     };
     let re = regex::Regex::new(r#"href="?(https://xiaomirom\.com/rom/[^"\s>]+)"#).unwrap();
+    let device_slug = format!("-{}-", base.to_ascii_lowercase());
     let mut pages: Vec<String> = re
         .captures_iter(&html)
         .filter_map(|c| c.get(1).map(|m| m.as_str().to_string()))
+        .filter(|page| {
+            reqwest::Url::parse(page)
+                .is_ok_and(|url| url.path().to_ascii_lowercase().contains(&device_slug))
+        })
         .collect();
     pages.sort();
     pages.dedup();
@@ -556,21 +609,97 @@ pub fn xiaomirom_history(base: &str) -> Vec<Rom> {
     out
 }
 
-/// 解析下载页，取出所有官方 CDN 镜像地址
-pub fn resolve_download(detail: &str) -> Vec<String> {
-    let Ok(html) = net::fetch_text(detail) else {
-        return Vec::new();
+fn package_suffix(method: &str) -> Option<&'static str> {
+    match method {
+        "卡刷" => Some(".zip"),
+        "线刷" => Some(".tgz"),
+        _ => None,
+    }
+}
+
+pub fn package_url_matches(raw: &str, key: &RomKey) -> bool {
+    let Some(url) = net::firmware_url(raw) else { return false };
+    let Some(suffix) = package_suffix(&key.method) else { return false };
+    let Some(name) = url.path_segments().and_then(|mut parts| parts.next_back()) else {
+        return false;
     };
-    let re = regex::Regex::new(
-        r#"https://(?:bigota|cdnorg|hugeota|bn)\.d\.miui\.com/[^"'\s<]+|https://bkt-sgp-[^"'\s<]+"#,
-    )
-    .unwrap();
-    let mut urls: Vec<String> = re
-        .find_iter(&html)
-        .map(|m| m.as_str().to_string())
-        .filter(|u| u.contains(".zip") || u.contains(".tgz"))
-        .collect();
-    urls.sort();
-    urls.dedup();
-    urls
+    let Some(stem) = name.strip_suffix(suffix) else { return false };
+    url.path_segments()
+        .is_some_and(|mut parts| parts.any(|part| part.eq_ignore_ascii_case(&key.version)))
+        || stem
+            .split('_')
+            .any(|part| part.eq_ignore_ascii_case(&key.version))
+}
+
+fn matching_downloads(html: &str, key: &RomKey) -> Result<Vec<String>, String> {
+    let links = regex::Regex::new(r#"https://[^"'\s<>]+"#).unwrap();
+    let mut matches: HashMap<String, Vec<String>> = HashMap::new();
+    for found in links.find_iter(html) {
+        let raw = unescape_html(found.as_str());
+        if package_url_matches(&raw, key) {
+            if let Some(url) = net::firmware_url(&raw) {
+                matches.entry(url.path().to_string()).or_default().push(raw);
+            }
+        }
+    }
+    let mut packages = matches.into_values();
+    let Some(mut mirrors) = packages.next() else {
+        return Err("历史版本页面没有提供与所选版本和刷机类型匹配的官方直链".into());
+    };
+    if packages.next().is_some() {
+        return Err("历史版本页面提供了多个不同的匹配文件，请核对来源页面".into());
+    }
+    mirrors.sort_unstable();
+    mirrors.dedup();
+    Ok(mirrors)
+}
+
+pub fn resolve_download(detail: &str, key: &RomKey) -> Result<Vec<String>, String> {
+    let html = net::fetch_text(detail).map_err(|err| format!("无法读取历史版本页面：{err}"))?;
+    matching_downloads(&html, key)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selected_rom_keeps_its_identity_when_history_changes_order() {
+        let device_rom = |version: &str, date: &str, url: &str| Rom {
+            version: version.into(),
+            region: "国行".into(),
+            method: "卡刷".into(),
+            branch: "稳定版".into(),
+            android: String::new(),
+            size_text: String::new(),
+            date: date.into(),
+            url: url.into(),
+            md5: String::new(),
+            detail: None,
+        };
+        let selected = device_rom("OS1.0.1.0", "2025-01-01", "existing URL");
+        let key = selected.key();
+        let mut roms = vec![selected];
+        merge_roms(&mut roms, vec![
+            device_rom("OS1.0.2.0", "2025-02-01", ""),
+            device_rom("OS1.0.1.0", "2025-01-01", ""),
+        ]);
+        assert_eq!(roms.len(), 2);
+        assert!(roms[1].matches(&key));
+        assert_eq!(roms[1].url, "existing URL");
+    }
+
+    #[test]
+    fn history_only_accepts_one_package_with_the_selected_version_and_type() {
+        let key = RomKey { version: "OS1.0.1.0".into(), region: "国行".into(), method: "卡刷".into() };
+        let archive = "https://bigota.d.miui.com/OS1.0.1.0/miui_demo_OS1.0.1.0.zip";
+        let mirror = archive.replace("bigota", "cdnorg");
+        let different_version = archive.replace("OS1.0.1.0", "OS1.0.10.0");
+        let fastboot = archive.replace(".zip", ".tgz");
+        let html = format!("<a href='{archive}'>A</a><a href='{mirror}'>B</a><a href='{different_version}'>C</a><a href='{fastboot}'>D</a>");
+        assert_eq!(matching_downloads(&html, &key).unwrap(), vec![archive.to_string(), mirror]);
+        assert!(matching_downloads(&fastboot, &key).is_err());
+        let another_package = archive.replace("miui_demo", "miui_other");
+        assert!(matching_downloads(&format!("{archive} {another_package}"), &key).is_err());
+    }
 }
