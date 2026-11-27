@@ -282,6 +282,7 @@ impl AppState {
             task.last_done = task.progress.done.load(Ordering::Relaxed);
             task.last_seen = Instant::now();
             task.state = TaskState::Running;
+            self.status = format!("正在下载：{}", task.title);
             let progress = Arc::clone(&task.progress);
             let conns = self.settings.connections.clamp(1, 64);
             task.handle = Some(context.spawn_background(move |_token| {
@@ -696,8 +697,12 @@ impl Component for AppState {
                     TaskState::Running => {
                         task.state = TaskState::Pausing;
                         task.progress.paused.store(true, Ordering::Relaxed);
+                        self.status = format!("正在暂停：{}", task.title);
                     }
-                    TaskState::Paused => task.state = TaskState::Queued,
+                    TaskState::Paused => {
+                        task.state = TaskState::Queued;
+                        self.status = format!("已重新加入队列：{}", task.title);
+                    }
                     TaskState::Failed(_) if task.urls.is_empty() => self.resolve_task(id, context),
                     TaskState::Failed(_) => {
                         let urls = task.urls.clone();
@@ -709,7 +714,18 @@ impl Component for AppState {
             }
             Msg::CancelTask(id) => {
                 if let Some(task) = self.tasks.iter_mut().find(|t| t.id == id) {
+                    let has_partial = task.state == TaskState::Paused
+                        || task.progress.total.load(Ordering::Relaxed) > 0;
                     match task.state {
+                        TaskState::Paused | TaskState::Queued if has_partial => {
+                            if let Some(dest) = task.dest.clone() {
+                                task.state = TaskState::Cancelling;
+                                self.status = format!("正在取消：{}", task.title);
+                                task.handle = Some(context.spawn_background(move |_token| {
+                                    Msg::TaskDone(id, download::discard_partial(&dest).map(|()| Outcome::Cancelled))
+                                }));
+                            }
+                        }
                         TaskState::Resolving | TaskState::Queued => {
                             task.handle = None;
                             task.state = TaskState::Cancelled;
@@ -717,15 +733,8 @@ impl Component for AppState {
                         }
                         TaskState::Running | TaskState::Pausing => {
                             task.state = TaskState::Cancelling;
+                            self.status = format!("正在取消：{}", task.title);
                             task.progress.cancel.store(true, Ordering::Relaxed);
-                        }
-                        TaskState::Paused => {
-                            if let Some(dest) = task.dest.clone() {
-                                task.state = TaskState::Cancelling;
-                                task.handle = Some(context.spawn_background(move |_token| {
-                                    Msg::TaskDone(id, download::discard_partial(&dest).map(|()| Outcome::Cancelled))
-                                }));
-                            }
                         }
                         _ => {}
                     }
@@ -829,7 +838,7 @@ impl Component for AppState {
     }
 
     fn view(&self, _input: &(), context: &mut ViewContext<Self>) -> View {
-        context.window_title("小米固件下载器");
+        context.window_title(concat!("小米固件下载器 v", env!("CARGO_PKG_VERSION")));
         context.window_visuals(
             WindowVisuals::new()
                 .backdrop(WindowBackdrop::Mica)
