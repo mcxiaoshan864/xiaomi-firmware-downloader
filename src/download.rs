@@ -453,12 +453,11 @@ impl Transfer<'_> {
                 });
             // Even bytes written by an incomplete attempt will be overwritten in full.
             // Only publish this block after the complete response has been validated.
-            if matches!(result, Ok(true)) {
-                return Ok(true);
+            if !matches!(result, Ok(true)) {
+                self.progress.done.fetch_sub(counted, Relaxed);
             }
-            self.progress.done.fetch_sub(counted, Relaxed);
             match result {
-                Ok(true) => unreachable!(),
+                Ok(true) => return Ok(true),
                 Ok(false) => return Ok(false),
                 Err(CopyError::Disk(err)) => return Err(format!("写入固件失败：{err}")),
                 Err(CopyError::Network(err)) => last = err,
@@ -586,13 +585,12 @@ impl Segments<'_> {
         }
         let checkpoint = state.into_inner().unwrap();
         let complete = checkpoint.done.len() as u64 == blocks;
-        if !complete || self.progress.interruption().is_some() || result.is_err() {
-            if let Err(err) = self.save(total, &checkpoint.done) {
-                return Err(match result {
-                    Ok(()) => err,
-                    Err(original) => format!("{original}。{err}"),
-                });
-            }
+        // The complete checkpoint also allows resuming a paused checksum or final rename.
+        if let Err(err) = self.save(total, &checkpoint.done) {
+            return Err(match result {
+                Ok(()) => err,
+                Err(original) => format!("{original}。{err}"),
+            });
         }
         if result.is_ok() && !complete && self.progress.interruption().is_none() {
             return Err("部分固件分段未完成".into());
@@ -754,13 +752,7 @@ pub fn run(
         file.set_len(total).map_err(|e| format!("无法预分配磁盘空间：{e}"))?;
         progress.set_phase("分段下载");
         let segments = Segments { target: &target, file: &file, sources: &sources, progress: &progress, identity, block, workers };
-        let result = segments.run(done);
-        // Keep the completed checkpoint if the user pauses during final verification.
-        if result.is_ok() && progress.interruption().is_none() {
-            let complete = (0..total.div_ceil(block)).collect();
-            segments.save(total, &complete)?;
-        }
-        result
+        segments.run(done)
     } else {
         remove_if_exists(&target.meta)?;
         file.set_len(total).map_err(|e| format!("无法预分配磁盘空间：{e}"))?;
@@ -823,5 +815,28 @@ mod tests {
         let different = Identity::Md5("second".into());
         assert!(checkpoint_for(Some(checkpoint()), &different, total, total, 64).1.is_empty());
         assert!(checkpoint_for(Some(checkpoint()), &old_identity, total, 0, 64).1.is_empty());
+    }
+
+    #[test]
+    fn windows_target_is_exclusive_and_promotion_never_overwrites_a_file() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let folder = std::env::temp_dir().join(format!("mifw-{}-{nonce}", std::process::id()));
+        let path = folder.join("firmware.zip");
+        let target = Target::claim(&path).unwrap();
+        assert!(Target::claim(&path).is_err());
+        fs::write(&target.part, b"download").unwrap();
+        fs::write(&target.dest, b"existing").unwrap();
+        assert!(promote_part(&target.part, &target.dest).is_err());
+        assert_eq!(fs::read(&target.dest).unwrap(), b"existing");
+        assert_eq!(fs::read(&target.part).unwrap(), b"download");
+        drop(target);
+        let target = Target::claim(&path).unwrap();
+        target.clear_partial().unwrap();
+        fs::remove_file(&target.dest).unwrap();
+        drop(target);
+        fs::remove_dir(folder).unwrap();
     }
 }

@@ -27,11 +27,11 @@ const TRACKER_MIRRORS: &[&str] = &[
 type HttpClient = reqwest::blocking::Client;
 
 fn build_client(proxy: Option<&str>) -> HttpClient {
-    // 整体超时给足 10 分钟：8MB 的块在 30KB/s 的线路上也不会被误杀。
-    // 之前 30 秒总超时会导致慢线路每块都失败、一直重试，速度接近 0。
+    // With reqwest's blocking client this timeout applies to each streaming read.
+    // A slow transfer can keep making progress, but a stalled read cannot delay a pause indefinitely.
     let mut builder = reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(600))
+        .timeout(Duration::from_secs(15))
         .redirect(redirect_policy())
         .user_agent(UA);
     if let Some(url) = proxy {

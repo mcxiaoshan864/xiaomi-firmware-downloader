@@ -53,9 +53,15 @@ pub fn merge_roms(roms: &mut Vec<Rom>, extra: Vec<Rom>) {
             continue;
         }
         let strength = |r: &Rom| (!r.url.is_empty(), !r.md5.is_empty());
-        let entry = entries.entry(rom.key()).or_insert_with(|| rom.clone());
-        if strength(&rom) > strength(entry) {
-            *entry = rom;
+        match entries.entry(rom.key()) {
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(rom);
+            }
+            std::collections::hash_map::Entry::Occupied(mut slot) => {
+                if strength(&rom) > strength(slot.get()) {
+                    slot.insert(rom);
+                }
+            }
         }
     }
     roms.extend(entries.into_values());
@@ -571,9 +577,14 @@ pub fn xiaomirom_history(base: &str) -> Vec<Rom> {
         return Vec::new();
     };
     let re = regex::Regex::new(r#"href="?(https://xiaomirom\.com/rom/[^"\s>]+)"#).unwrap();
+    let device_slug = format!("-{}-", base.to_ascii_lowercase());
     let mut pages: Vec<String> = re
         .captures_iter(&html)
         .filter_map(|c| c.get(1).map(|m| m.as_str().to_string()))
+        .filter(|page| {
+            reqwest::Url::parse(page)
+                .is_ok_and(|url| url.path().to_ascii_lowercase().contains(&device_slug))
+        })
         .collect();
     pages.sort();
     pages.dedup();
